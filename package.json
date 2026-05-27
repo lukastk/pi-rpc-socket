@@ -1,0 +1,16 @@
+{
+  "name": "pi-rpc-socket",
+  "version": "0.1.0",
+  "description": "Pi extension: per-session Unix socket for RPC into a running Pi coding-agent session (send messages, abort, compact, query state and tmux info, subscribe to streamed events).",
+  "main": "index.ts",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lukastk/pi-rpc-socket.git"
+  },
+  "license": "MIT",
+  "keywords": ["pi", "pi-extension", "coding-agent", "rpc", "unix-socket"],
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*"
+  }
+}
