@@ -9,7 +9,10 @@
     "url": "git+https://github.com/lukastk/pi-rpc-socket.git"
   },
   "license": "MIT",
-  "keywords": ["pi", "pi-extension", "coding-agent", "rpc", "unix-socket"],
+  "keywords": ["pi", "pi-extension", "pi-package", "coding-agent", "rpc", "unix-socket"],
+  "pi": {
+    "extensions": ["./index.ts"]
+  },
   "peerDependencies": {
     "@mariozechner/pi-coding-agent": "*"
   }
