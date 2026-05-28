@@ -4,7 +4,7 @@ Pi extension that opens a Unix socket server inside the interactive TUI session 
 
 ## How it works
 
-On `session_start`, the extension creates a Unix socket at `$TMPDIR/pi-rpc-sockets/<sessionId>.sock` (falling back to `/tmp` when `$TMPDIR` is unset). External processes connect, send JSON commands, and interact with the live Pi session.
+On `session_start`, the extension creates a Unix socket at `<tmpdir>/pi-rpc-sockets/<sessionId>.sock`. The `<tmpdir>` is picked to keep the full socket path inside the OS `sun_path` limit (104 bytes on macOS, 108 on Linux): the extension tries `$TMPDIR` first, then `/tmp`, then `/var/tmp`, and uses the first one whose `<dir>/pi-rpc-sockets/<uuid>.sock` fits. On macOS this means `$TMPDIR` (which defaults to a long `/var/folders/<u>/<n>/T/`) is bypassed in favor of `/tmp`, so the socket actually binds.
 
 On `session_shutdown`, the socket is cleaned up.
 

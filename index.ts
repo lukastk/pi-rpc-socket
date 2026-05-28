@@ -37,7 +37,37 @@ import * as path from "node:path";
 import { execFileSync } from "node:child_process";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 
-const SOCKETS_DIR = path.join(process.env.TMPDIR || "/tmp", "pi-rpc-sockets");
+/**
+ * Pick a sockets-dir whose Unix-domain socket paths will fit inside
+ * sun_path. macOS caps that struct at 104 bytes (Linux at 108); a Pi
+ * session ID is a 36-char UUID, plus "/" + ".sock" = 42 chars, so we
+ * leave ~50 bytes of headroom. The default macOS $TMPDIR is
+ * /var/folders/<u>/<n>/T/ (≈47 chars) which alone would make the full
+ * socket path overflow. Try $TMPDIR first (matches the original
+ * intent and Termux/Linux behavior); fall back to /tmp, then /var/tmp.
+ */
+function pickSocketsDir(): string {
+	const SUN_PATH_LIMIT = 104;
+	const RESERVED_FOR_SOCKETNAME = 50;
+	const seen = new Set<string>();
+	const candidates: string[] = [];
+	for (const c of [process.env.TMPDIR, "/tmp", "/var/tmp"]) {
+		if (!c) continue;
+		const trimmed = c.replace(/\/+$/, "");
+		if (seen.has(trimmed)) continue;
+		seen.add(trimmed);
+		candidates.push(trimmed);
+	}
+	for (const c of candidates) {
+		const dir = path.join(c, "pi-rpc-sockets");
+		if (dir.length + RESERVED_FOR_SOCKETNAME <= SUN_PATH_LIMIT) return dir;
+	}
+	// No candidate fits; return the first one anyway and let listen() error
+	// loudly rather than silently picking something surprising.
+	return path.join(candidates[0] ?? "/tmp", "pi-rpc-sockets");
+}
+
+const SOCKETS_DIR = pickSocketsDir();
 
 /**
  * Detect tmux session/pane info from the Pi process's environment.
