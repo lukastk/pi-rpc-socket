@@ -29,13 +29,14 @@
  *     {"event":"text_delta","delta":"Hello "}
  *     {"event":"tool_execution_start","toolName":"web_search"}
  *     {"event":"tool_execution_end","toolName":"web_search"}
- *     {"event":"agent_end"}
+ *     {"event":"agent_end","stopReason":"stop","model":"...","provider":"...","usage":{...}}
  */
 import * as net from "node:net";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { execFileSync } from "node:child_process";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { AssistantMessage } from "@mariozechner/pi-ai";
 
 /**
  * Pick a sockets-dir whose Unix-domain socket paths will fit inside
@@ -138,6 +139,10 @@ export default function (pi: ExtensionAPI) {
 	// commands can call ctx.abort() etc. outside of an event handler.
 	let latestCtx: any = null;
 
+	// Session ID captured at session_start (the socket filename is derived from it).
+	// Stable for the lifetime of this session; avoids relying on latestCtx for it.
+	let sessionId: string | null = null;
+
 	// Capture ctx from any event that provides it
 	const captureCtx = async (_event: any, ctx: any) => { latestCtx = ctx; };
 	pi.on("session_start", captureCtx);
@@ -179,15 +184,36 @@ export default function (pi: ExtensionAPI) {
 		});
 	});
 
-	pi.on("agent_end", async () => {
-		broadcast({ event: "agent_end" });
+	pi.on("agent_end", async (event) => {
+		// Pluck the final AssistantMessage from the turn so subscribers receive
+		// token usage / cost / stopReason without having to re-read the on-disk
+		// JSONL. Matches the shape produced by `pi -p --mode json`'s agent_end.
+		const messages = (event as any).messages as unknown[] | undefined;
+		let last: AssistantMessage | undefined;
+		if (Array.isArray(messages)) {
+			for (let i = messages.length - 1; i >= 0; i--) {
+				const m = messages[i] as { role?: string };
+				if (m && m.role === "assistant") {
+					last = m as AssistantMessage;
+					break;
+				}
+			}
+		}
+		const payload: Record<string, unknown> = { event: "agent_end" };
+		if (last) {
+			payload.stopReason = last.stopReason;
+			payload.model = last.model;
+			payload.provider = last.provider;
+			payload.usage = last.usage;
+		}
+		broadcast(payload);
 		currentTurnFromSocket = false;
 	});
 
 	// --- Socket server ---
 	pi.on("session_start", async (_event, ctx) => {
 		latestCtx = ctx;
-		const sessionId = ctx.sessionManager.getSessionId();
+		sessionId = ctx.sessionManager.getSessionId();
 
 		fs.mkdirSync(SOCKETS_DIR, { recursive: true });
 
@@ -211,11 +237,18 @@ export default function (pi: ExtensionAPI) {
 					const trimmed = line.trim();
 					if (!trimmed) continue;
 
+					let parsed: any;
 					try {
-						const parsed = JSON.parse(trimmed);
-						handleCommand(parsed, conn);
+						parsed = JSON.parse(trimmed);
 					} catch (e: any) {
 						conn.write(JSON.stringify({ error: `invalid JSON: ${e.message}` }) + "\n");
+						continue;
+					}
+
+					try {
+						handleCommand(parsed, conn);
+					} catch (e: any) {
+						conn.write(JSON.stringify({ error: `command failed: ${e.message}` }) + "\n");
 					}
 				}
 			});
@@ -268,17 +301,21 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
-		// Compact context
+		// Compact context.
+		// ExtensionAPI.compact is typed `(options?: CompactOptions) => void` —
+		// it kicks off compaction without awaiting completion. Reply immediately;
+		// completion can be observed via the `session_compact` event.
 		if (parsed.compact === true) {
 			if (!latestCtx) {
 				reply({ error: "no context available" });
 				return;
 			}
-			latestCtx.compact().then(() => {
-				reply({ ok: true, compacted: true });
-			}).catch((e: any) => {
+			try {
+				latestCtx.compact();
+				reply({ ok: true, compacted: true, note: "kicked off; completion is async" });
+			} catch (e: any) {
 				reply({ error: `compact failed: ${e.message}` });
-			});
+			}
 			return;
 		}
 
@@ -290,14 +327,27 @@ export default function (pi: ExtensionAPI) {
 			}
 			const idle = latestCtx.isIdle();
 			const usage = latestCtx.getContextUsage?.() ?? null;
+			// Current model/provider come from ctx.model (may be undefined if no
+			// model is configured). Pi exposes a single thinking level via
+			// pi.getThinkingLevel(); providers map it to their own representation
+			// (OpenAI "reasoning_effort", Anthropic budget tokens, etc.). There
+			// is no separate top-level "effort" field on the SDK.
+			const model = latestCtx.model;
+			const config = {
+				provider: model?.provider ?? null,
+				model: model?.id ?? null,
+				thinkingLevel: pi.getThinkingLevel(),
+			};
 			reply({
 				ok: true,
 				state: {
+					sessionId,
 					idle,
 					contextUsage: usage,
 					hasAppendedSystemPrompt: appendedSystemPrompt !== null,
 					cwd: process.cwd(),
 					tmux: getTmuxInfo() ?? { inTmux: false },
+					config,
 				},
 			});
 			return;
@@ -337,7 +387,16 @@ export default function (pi: ExtensionAPI) {
 		reply({ error: "unknown command" });
 	}
 
-	pi.on("session_shutdown", async () => {
+	pi.on("session_shutdown", async (event) => {
+		// Notify subscribers before tearing down so clients can distinguish a
+		// clean shutdown from an unexpected ECONNRESET. Best-effort: ignore
+		// per-conn write failures.
+		const reason = (event as any)?.reason;
+		const shutdownLine =
+			JSON.stringify({ event: "session_shutdown", reason: reason ?? null }) + "\n";
+		for (const conn of subscribers) {
+			try { conn.write(shutdownLine); } catch {}
+		}
 		subscribers.clear();
 		if (server) {
 			server.close();
