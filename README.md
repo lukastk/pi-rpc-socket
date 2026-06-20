@@ -24,6 +24,7 @@ One JSON object per line (LF-delimited):
 | Query tmux info | `{"getTmuxInfo":true}` |
 | Append to system prompt | `{"appendSystemPrompt":"voice mode instructions..."}` |
 | Clear appended system prompt | `{"clearSystemPrompt":true}` |
+| Set conversation model (live) | `{"set_model":"<pattern>"}` |
 
 ### Responses
 
@@ -33,7 +34,8 @@ One JSON object per line (LF-delimited):
 | Success (subscribe) | `{"ok":true,"subscribed":true}` |
 | Success (abort) | `{"ok":true,"aborted":true}` |
 | Success (compact) | `{"ok":true,"compacted":true}` |
-| State | `{"ok":true,"state":{"idle":true,"contextUsage":...,"hasAppendedSystemPrompt":false,"cwd":"/path/to/workdir","tmux":...}}` |
+| Success (set_model) | `{"ok":true,"model":{"provider":"anthropic","id":"claude-haiku-4-5"},"note":"model set; takes effect on the next turn"}` |
+| State | `{"ok":true,"state":{"idle":true,"contextUsage":...,"hasAppendedSystemPrompt":false,"cwd":"/path/to/workdir","tmux":...,"config":{"provider":"anthropic","model":"claude-opus-4-8","thinkingLevel":"high"}}}` |
 | Tmux info | `{"ok":true,"tmux":{"inTmux":true,"session":"main","window":"pi","paneId":"%5"}}` |
 | Error | `{"error":"reason"}` |
 
@@ -101,6 +103,26 @@ Clear with:
 ```bash
 echo '{"clearSystemPrompt":true}' | nc -U $TMPDIR/pi-rpc-sockets/<sessionId>.sock
 ```
+
+### Switch the model mid-session
+
+Switch the conversation's model live, without restarting Pi — the same operation as the TUI's model picker / `Ctrl+P` cycling (`session.setModel` under the hood). The new model takes effect on the **next turn**, and `getState` (`state.config.model`) reflects it immediately so a client can confirm the switch:
+
+```bash
+echo '{"set_model":"claude-haiku-4-5"}' | nc -U $TMPDIR/pi-rpc-sockets/<sessionId>.sock
+# {"ok":true,"model":{"provider":"anthropic","id":"claude-haiku-4-5"},"note":"model set; takes effect on the next turn"}
+```
+
+The pattern is resolved with Pi's own model-resolution rules (as used by `--model` / the `/model` picker): an exact `provider/id` reference, then an exact bare `id` (rejected if ambiguous across providers), then a partial substring match on id/name preferring an alias (e.g. `claude-sonnet-4-5`) over dated versions. Only models with configured auth (the ones Pi could actually switch to) are considered.
+
+An unknown or unauthenticated model is a **loud error**, not a silent no-op:
+
+```bash
+echo '{"set_model":"no-such-model"}' | nc -U $TMPDIR/pi-rpc-sockets/<sessionId>.sock
+# {"error":"set_model: unknown model \"no-such-model\" (no available model matches)"}
+```
+
+Like the TUI's model switch, this also updates Pi's saved default model.
 
 ### From Node.js
 

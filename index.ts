@@ -20,6 +20,7 @@
  *     {"getTmuxInfo":true}                Query tmux session/pane info
  *     {"appendSystemPrompt":"..."}        Append to system prompt (persistent)
  *     {"clearSystemPrompt":true}          Remove appended system prompt
+ *     {"set_model":"<pattern>"}           Switch the conversation model live
  *
  *   Responses:
  *     {"ok":true,...}                     Success
@@ -69,6 +70,73 @@ function pickSocketsDir(): string {
 }
 
 const SOCKETS_DIR = pickSocketsDir();
+
+/**
+ * Resolve a model pattern to a single Model, mirroring how Pi's own model
+ * resolution works for `--model` / `--models` patterns and the TUI model
+ * picker. Pi's resolver lives in `core/model-resolver.ts`
+ * (`findExactModelReferenceMatch` + the partial-match fallback used by
+ * `resolveModelScope`/`tryMatchModel`), but those functions are not part of
+ * the package's public export surface (only "." is exported), so we cannot
+ * import them from an extension. This is a faithful port of that logic over
+ * the public `ModelRegistry` API.
+ *
+ * Matching precedence (same as Pi):
+ *   1. Exact canonical reference `provider/id` (case-insensitive).
+ *   2. Exact bare `id` (rejected if ambiguous across providers).
+ *   3. Partial substring match on `id`/`name`, preferring an alias
+ *      (e.g. `claude-sonnet-4-5`) over dated versions, then highest-sorting.
+ *
+ * Returns the resolved Model, or undefined if the pattern matches nothing.
+ */
+function isModelAlias(id: string): boolean {
+	if (id.endsWith("-latest")) return true;
+	return !/-\d{8}$/.test(id);
+}
+
+function resolveModelByPattern(pattern: string, models: any[]): any | undefined {
+	const trimmed = pattern.trim();
+	if (!trimmed) return undefined;
+	const normalized = trimmed.toLowerCase();
+
+	// 1. Exact canonical "provider/id"
+	const canonical = models.filter(
+		(m) => `${m.provider}/${m.id}`.toLowerCase() === normalized,
+	);
+	if (canonical.length === 1) return canonical[0];
+	if (canonical.length > 1) return undefined;
+
+	// 2. "provider/modelId" split (when the slash is a provider separator)
+	const slash = trimmed.indexOf("/");
+	if (slash !== -1) {
+		const provider = trimmed.slice(0, slash).trim().toLowerCase();
+		const modelId = trimmed.slice(slash + 1).trim().toLowerCase();
+		if (provider && modelId) {
+			const byProvider = models.filter(
+				(m) => m.provider.toLowerCase() === provider && m.id.toLowerCase() === modelId,
+			);
+			if (byProvider.length === 1) return byProvider[0];
+			if (byProvider.length > 1) return undefined;
+		}
+	}
+
+	// 3. Exact bare id
+	const byId = models.filter((m) => m.id.toLowerCase() === normalized);
+	if (byId.length === 1) return byId[0];
+	if (byId.length > 1) return undefined;
+
+	// 4. Partial substring match on id/name, alias-preferred
+	const partial = models.filter(
+		(m) =>
+			m.id.toLowerCase().includes(normalized) ||
+			(typeof m.name === "string" && m.name.toLowerCase().includes(normalized)),
+	);
+	if (partial.length === 0) return undefined;
+	const aliases = partial.filter((m) => isModelAlias(m.id));
+	const pool = aliases.length > 0 ? aliases : partial;
+	pool.sort((a, b) => b.id.localeCompare(a.id));
+	return pool[0];
+}
 
 /**
  * Detect tmux session/pane info from the Pi process's environment.
@@ -366,6 +434,54 @@ export default function (pi: ExtensionAPI) {
 		if (typeof parsed.appendSystemPrompt === "string") {
 			appendedSystemPrompt = parsed.appendSystemPrompt;
 			reply({ ok: true, appendedSystemPrompt: true });
+			return;
+		}
+
+		// Set the conversation model live (mid-session, no restart).
+		// Mirrors the TUI's model switching (session.setModel via ctx.setModel):
+		// the new model is used on the next turn and is reflected by getState.
+		if (typeof parsed.set_model === "string") {
+			if (!latestCtx) {
+				reply({ error: "no context available" });
+				return;
+			}
+			const pattern = parsed.set_model.trim();
+			if (!pattern) {
+				reply({ error: "set_model: empty pattern" });
+				return;
+			}
+			// Refresh so newly-added models / auth are visible, then resolve
+			// against models that actually have configured auth (the only ones
+			// we could switch to). An unmatched pattern is a loud error.
+			latestCtx.modelRegistry.refresh();
+			const available = latestCtx.modelRegistry.getAvailable();
+			const model = resolveModelByPattern(pattern, available);
+			if (!model) {
+				reply({
+					error: `set_model: unknown model "${pattern}" (no available model matches)`,
+				});
+				return;
+			}
+			// pi.setModel returns false if the model has no configured auth.
+			// We resolved from getAvailable(), so this should hold, but surface
+			// it loudly rather than silently no-op if it ever returns false.
+			pi.setModel(model)
+				.then((ok: boolean) => {
+					if (ok) {
+						reply({
+							ok: true,
+							model: { provider: model.provider, id: model.id },
+							note: "model set; takes effect on the next turn",
+						});
+					} else {
+						reply({
+							error: `set_model: no configured auth for ${model.provider}/${model.id}`,
+						});
+					}
+				})
+				.catch((e: any) => {
+					reply({ error: `set_model failed: ${e?.message ?? String(e)}` });
+				});
 			return;
 		}
 
