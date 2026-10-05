@@ -1,3 +1,5 @@
 node_modules/
 *.log
 .DS_Store
+# Git-installed Pi packages run npm install per machine; the generated lock is local.
+package-lock.json

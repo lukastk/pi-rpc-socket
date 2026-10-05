@@ -1,7 +1,7 @@
 {
   "name": "pi-rpc-socket",
-  "version": "0.1.0",
-  "description": "Pi extension: per-session Unix socket for RPC into a running Pi coding-agent session (send messages, abort, compact, query state and tmux info, subscribe to streamed events).",
+  "version": "0.2.0",
+  "description": "Per-session RPC into a running Pi TUI: messages, explicit commands and correlated operation outcomes.",
   "main": "index.ts",
   "type": "module",
   "repository": {
@@ -11,9 +11,22 @@
   "license": "MIT",
   "keywords": ["pi", "pi-extension", "pi-package", "coding-agent", "rpc", "unix-socket"],
   "pi": {
-    "extensions": ["./index.ts"]
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "scripts": {
+    "test": "node --import tsx --test test/*.test.ts",
+    "typecheck": "tsc --noEmit"
   },
   "peerDependencies": {
-    "@mariozechner/pi-coding-agent": "*"
+    "@earendil-works/pi-coding-agent": ">=0.99.1"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "^0.99.1",
+    "@earendil-works/pi-coding-agent": "0.99.1",
+    "@types/node": "^24.0.0",
+    "tsx": "^4.23.15",
+    "typescript": "^5.9.0"
   }
 }

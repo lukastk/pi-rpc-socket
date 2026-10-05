@@ -15,7 +15,10 @@
  *     {"message":"prompt text"}           Send a message (delivered as steer)
  *     {"subscribe":true}                  Start receiving Pi events
  *     {"abort":true}                      Cancel current agent operation
- *     {"compact":true}                    Trigger context compaction
+ *     {"compact":true}                    Compact; ACK only on completion/error
+ *     {"id":"...","capabilities":true}    Discover protocol 2 and command resources
+ *     {"id":"...","command":"/..."}       Explicit command (returns an operation)
+ *     {"id":"...","getOperation":"..."}   Poll a command, never re-execute it
  *     {"getState":true}                   Query agent state (idle, context, cwd, tmux)
  *     {"getTmuxInfo":true}                Query tmux session/pane info
  *     {"appendSystemPrompt":"..."}        Append to system prompt (persistent)
@@ -36,8 +39,9 @@ import * as net from "node:net";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { execFileSync } from "node:child_process";
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import type { AssistantMessage } from "@mariozechner/pi-ai";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { AssistantMessage } from "@earendil-works/pi-ai";
+import { Commands } from "./commands.ts";
 
 /**
  * Pick a sockets-dir whose Unix-domain socket paths will fit inside
@@ -205,7 +209,21 @@ export default function (pi: ExtensionAPI) {
 	// --- Latest ctx reference for abort/compact/state ---
 	// Event handlers receive ctx; we capture the latest one so socket
 	// commands can call ctx.abort() etc. outside of an event handler.
-	let latestCtx: any = null;
+	let latestCtx: ExtensionContext | null = null;
+	const context = () => {
+		if (!latestCtx) throw new Error("no session context available");
+		return latestCtx;
+	};
+	const commands = new Commands(pi, context, setModel, () => { pendingSocketMessage = true; });
+	async function setModel(pattern: string) {
+		if (!pattern.trim()) throw new Error("set_model: empty pattern");
+		const ctx = context();
+		ctx.modelRegistry.refresh();
+		const model = resolveModelByPattern(pattern, ctx.modelRegistry.getAvailable());
+		if (!model) throw new Error(`set_model: unknown model "${pattern}" (no available model matches)`);
+		if (!await pi.setModel(model)) throw new Error(`set_model: no configured auth for ${model.provider}/${model.id}`);
+		return { model: { provider: model.provider, id: model.id } };
+	}
 
 	// Session ID captured at session_start (the socket filename is derived from it).
 	// Stable for the lifetime of this session; avoids relying on latestCtx for it.
@@ -295,9 +313,10 @@ export default function (pi: ExtensionAPI) {
 
 		server = net.createServer((conn) => {
 			let buffer = "";
+			conn.setEncoding("utf8"); // Preserve multibyte characters split across network reads.
 
 			conn.on("data", (data) => {
-				buffer += data.toString();
+				buffer += data;
 				const lines = buffer.split("\n");
 				buffer = lines.pop()!;
 
@@ -316,7 +335,7 @@ export default function (pi: ExtensionAPI) {
 					try {
 						handleCommand(parsed, conn);
 					} catch (e: any) {
-						conn.write(JSON.stringify({ error: `command failed: ${e.message}` }) + "\n");
+						conn.write(JSON.stringify({ id: parsed?.id, ok: false, error: `command failed: ${e.message}` }) + "\n");
 					}
 				}
 			});
@@ -344,8 +363,26 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	function handleCommand(parsed: any, conn: net.Socket) {
-		const reply = (data: Record<string, unknown>) =>
-			conn.write(JSON.stringify(data) + "\n");
+		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("request must be an object");
+		if (parsed.id !== undefined && (typeof parsed.id !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(parsed.id))) throw new Error("invalid request id");
+		const operations = ["message", "subscribe", "abort", "compact", "getState", "getTmuxInfo", "appendSystemPrompt", "clearSystemPrompt", "set_model", "capabilities", "command", "getOperation"];
+		if (operations.filter(k => Object.hasOwn(parsed, k)).length !== 1) throw new Error("request must contain exactly one operation");
+		const reply = (data: Record<string, unknown>) => {
+			if (!conn.destroyed) conn.write(JSON.stringify({ ...data, id: parsed.id }) + "\n");
+		};
+		if (parsed.capabilities === true) {
+			reply({ ok: true, ...commands.capabilities(), sessionId, tmux: getTmuxInfo() });
+			return;
+		}
+		if (typeof parsed.command === "string") {
+			if (typeof parsed.id !== "string") throw new Error("command requires a request id");
+			reply({ ok: true, operation: commands.start(parsed.id, parsed.command) });
+			return;
+		}
+		if (typeof parsed.getOperation === "string") {
+			reply({ ok: true, operation: commands.get(parsed.getOperation) });
+			return;
+		}
 
 		// Subscribe to events
 		if (parsed.subscribe === true) {
@@ -369,21 +406,14 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
-		// Compact context.
-		// ExtensionAPI.compact is typed `(options?: CompactOptions) => void` —
-		// it kicks off compaction without awaiting completion. Reply immediately;
-		// completion can be observed via the `session_compact` event.
+		// Legacy direct operation: reply ONLY on real completion, never at kickoff.
+		// The v2 command operation supports polling without holding a connection open.
 		if (parsed.compact === true) {
-			if (!latestCtx) {
-				reply({ error: "no context available" });
-				return;
-			}
-			try {
-				latestCtx.compact();
-				reply({ ok: true, compacted: true, note: "kicked off; completion is async" });
-			} catch (e: any) {
-				reply({ error: `compact failed: ${e.message}` });
-			}
+			if (parsed.instructions !== undefined && typeof parsed.instructions !== "string") throw new Error("instructions must be text");
+			void commands.compact(parsed.instructions).then(
+				result => reply({ ok: true, compacted: true, result }),
+				error => reply({ ok: false, error: error.message }),
+			);
 			return;
 		}
 
@@ -437,51 +467,9 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
-		// Set the conversation model live (mid-session, no restart).
-		// Mirrors the TUI's model switching (session.setModel via ctx.setModel):
-		// the new model is used on the next turn and is reflected by getState.
 		if (typeof parsed.set_model === "string") {
-			if (!latestCtx) {
-				reply({ error: "no context available" });
-				return;
-			}
-			const pattern = parsed.set_model.trim();
-			if (!pattern) {
-				reply({ error: "set_model: empty pattern" });
-				return;
-			}
-			// Refresh so newly-added models / auth are visible, then resolve
-			// against models that actually have configured auth (the only ones
-			// we could switch to). An unmatched pattern is a loud error.
-			latestCtx.modelRegistry.refresh();
-			const available = latestCtx.modelRegistry.getAvailable();
-			const model = resolveModelByPattern(pattern, available);
-			if (!model) {
-				reply({
-					error: `set_model: unknown model "${pattern}" (no available model matches)`,
-				});
-				return;
-			}
-			// pi.setModel returns false if the model has no configured auth.
-			// We resolved from getAvailable(), so this should hold, but surface
-			// it loudly rather than silently no-op if it ever returns false.
-			pi.setModel(model)
-				.then((ok: boolean) => {
-					if (ok) {
-						reply({
-							ok: true,
-							model: { provider: model.provider, id: model.id },
-							note: "model set; takes effect on the next turn",
-						});
-					} else {
-						reply({
-							error: `set_model: no configured auth for ${model.provider}/${model.id}`,
-						});
-					}
-				})
-				.catch((e: any) => {
-					reply({ error: `set_model failed: ${e?.message ?? String(e)}` });
-				});
+			void setModel(parsed.set_model).then(result => reply({ ok: true, ...result }),
+				error => reply({ ok: false, error: error.message }));
 			return;
 		}
 
@@ -495,8 +483,8 @@ export default function (pi: ExtensionAPI) {
 		// Send message
 		if (typeof parsed.message === "string" && parsed.message.trim()) {
 			pendingSocketMessage = true;
-			pi.sendUserMessage(parsed.message, { deliverAs: "steer" });
-			reply({ ok: true, delivered: parsed.message });
+			pi.sendUserMessage(parsed.message, { deliverAs: "steer", expandPromptTemplates: false });
+			reply({ ok: true, delivered: parsed.message, status: "submitted" });
 			return;
 		}
 
