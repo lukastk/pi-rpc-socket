@@ -194,6 +194,8 @@ The fourth argument is optional out-of-band state that the socket creates itself
 
 The default extension factory capability-detects Pi's public `registerInteractiveReady(...)` API. On supported interactive runtimes it starts `live-v1` from `context.liveRpcSession`; on older Pi versions, print/JSON/RPC modes, and other runtimes without that capability, it leaves the legacy protocol-2 behavior unchanged. The attachment uses no private imports, monkey-patching, second agent, custom launcher, or public TCP listener.
 
+That decision is reported, not left for a client to infer from a missing socket: the protocol-2 `capabilities` reply carries `liveTransport` as `unsupported`, `supported` or `active` (see [Explicit commands](#explicit-commands--protocol-2-020)).
+
 ### Requests and frames
 
 Each request is one UTF-8 JSON object followed by LF:
@@ -447,6 +449,20 @@ Every response echoes `id` when supplied. A request carries exactly one operatio
 Command IDs are required (1–128 ASCII letters/digits/underscore/hyphen). A repeated
 ID is refused, not executed again; use `getOperation`. Capabilities include
 `protocol:2`, native `commands`, registered `resources`, session and tmux identity.
+
+Capabilities also report whether the **live-v1** transport below is available on the
+Pi that is actually running, so a client does not have to wait on a socket that will
+never appear:
+
+| `liveTransport` | Meaning |
+|---|---|
+| `unsupported` | This Pi has no interactive-ready capability. live-v1 is inert for the whole session and no `<sessionId>.live.sock` is created. Protocol 2 is unaffected — everything in this section works normally. |
+| `supported` | The capability exists and live-v1 is registered. The live socket appears when the session becomes interactive. |
+| `active` | The live socket is listening now. |
+
+`unsupported` is a normal outcome, not a failure: a Pi without the capability is a
+supported host for this extension, and the extension says so rather than logging a
+startup line about a transport its user may never use.
 
 Command/poll replies have `ok:true, operation:{status,result?,error?}`:
 

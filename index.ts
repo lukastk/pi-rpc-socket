@@ -101,6 +101,11 @@ export { inputImageSocketPath, legacySocketPath, liveSocketPath, pickSocketsDir 
  *     {"ok":true,...}                     Success
  *     {"error":"reason"}                  Error
  *
+ *   The capabilities reply also carries "liveTransport", which is
+ *   "unsupported" on a Pi without the interactive-ready capability (live-v1 is
+ *   inert for the session; protocol 2 is unaffected), "supported" once the
+ *   handler is registered, and "active" while the live socket is listening.
+ *
  *   Streamed events (subscribers only, only for socket-initiated turns):
  *     {"event":"text_delta","delta":"Hello "}
  *     {"event":"tool_execution_start","toolName":"web_search"}
@@ -298,10 +303,30 @@ async function resolveLiveTransferOptions(
 	}
 }
 
-/** Register live-v1 only when the running Pi exposes its public interactive-ready capability. */
-function registerLiveTransportIfSupported(pi: ExtensionAPI): void {
+/**
+ * What live-v1 can do on the Pi that is actually running.
+ *
+ *   "unsupported" -- this Pi has no interactive-ready capability, so live-v1 is
+ *                    inert for the whole session. Not an error: protocol 2 is
+ *                    unaffected and a Pi without the capability is a supported
+ *                    host for this extension.
+ *   "supported"   -- the capability exists and the handler is registered; the
+ *                    live socket appears when the session becomes interactive.
+ *   "active"      -- the live socket is listening now.
+ */
+type LiveTransportAvailability = "unsupported" | "supported" | "active";
+
+/**
+ * Register live-v1 only when the running Pi exposes its public interactive-ready
+ * capability, and return a reader for what was decided. The reader is reported
+ * through the protocol 2 `capabilities` reply, so a client can tell "this Pi
+ * cannot do live-v1" apart from "the live socket has not appeared yet" without
+ * polling the filesystem, and an unsupported host stays silent rather than
+ * printing a startup line about a capability its user never asked for.
+ */
+function registerLiveTransportIfSupported(pi: ExtensionAPI): () => LiveTransportAvailability {
 	const registrar = pi as ExtensionAPI & InteractiveReadyRegistrar;
-	if (typeof registrar.registerInteractiveReady !== "function") return;
+	if (typeof registrar.registerInteractiveReady !== "function") return () => "unsupported";
 
 	let activeServer: LiveTransportServer | undefined;
 	let starting = false;
@@ -327,10 +352,11 @@ function registerLiveTransportIfSupported(pi: ExtensionAPI): void {
 			starting = false;
 		}
 	});
+	return () => (activeServer ? "active" : "supported");
 }
 
 export default function (pi: ExtensionAPI) {
-	registerLiveTransportIfSupported(pi);
+	const liveTransportAvailability = registerLiveTransportIfSupported(pi);
 	let server: net.Server | null = null;
 	let socketPath: string | null = null;
 	const subscribers = new Set<net.Socket>();
@@ -523,7 +549,10 @@ export default function (pi: ExtensionAPI) {
 			if (!conn.destroyed) conn.write(JSON.stringify({ ...data, id: parsed.id }) + "\n");
 		};
 		if (parsed.capabilities === true) {
-			reply({ ok: true, ...commands.capabilities(), sessionId, tmux: getTmuxInfo() });
+			reply({
+				ok: true, ...commands.capabilities(), sessionId, tmux: getTmuxInfo(),
+				liveTransport: liveTransportAvailability(),
+			});
 			return;
 		}
 		if (typeof parsed.command === "string") {
