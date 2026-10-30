@@ -1,3 +1,75 @@
+export {
+	ATTACHMENT_CAPABILITY,
+	AttachmentTransferError,
+	initializeLiveAttachmentConsumer,
+	initializeLiveTransferMarker,
+	isCanonicalUuid,
+	readLiveAttachmentEnvironment,
+	type AttachmentTransferErrorCode,
+	type LiveAttachmentCapability,
+	type LiveAttachmentConsumer,
+	type LiveAttachmentConsumerOptions,
+	type LiveAttachmentEnvironment,
+	type LiveDispatchAttachment,
+	type LiveTransferCapability,
+	type LiveTransferMarker,
+	type LiveInputImageReaderDescriptor,
+	type PreparedAttachmentDispatch,
+	type PrepareRpcPromptFiles,
+	type PrepareRpcPromptFilesInput,
+	type RpcPromptFileInput,
+} from "./attachment-transfer.ts";
+export {
+	LIVE_PROTOCOL,
+	detectLiveImageAdmissionCapability,
+	startLiveTransport,
+	startLiveSessionTransport,
+	type CopyInputImageBytesOptions,
+	type CopyInputImageBytesResult,
+	type InputImageCapableLiveTransportHost,
+	type InputImageChunkWriter,
+	type LiveEvent,
+	type LiveHostDispatchOptions,
+	type LiveIdentity,
+	type LiveImageAdmissionCapability,
+	type LiveManagedArtifactOptions,
+	type LiveInputImageCapability,
+	type LiveOutputArtifactPresentationCapability,
+	type LiveSnapshot,
+	type LiveTransportHost,
+	type LiveTransportLimits,
+	type LiveTransportServer,
+	type StartLiveSessionTransportOptions,
+	type StartLiveTransportOptions,
+} from "./live-transport.ts";
+export {
+	MANAGED_ARTIFACT_CAPABILITY,
+	MANAGED_ARTIFACT_LIMITS,
+	createManagedArtifactSeshClient,
+	deriveManagedArtifactClientId,
+	startManagedArtifactPublisher,
+	type ArtifactCapableLiveTransportHost,
+	type ManagedArtifactPublisher,
+	type ManagedArtifactPublisherLimits,
+	type ManagedArtifactPublisherOptions,
+	type ManagedArtifactRuntimeMapping,
+	type ManagedArtifactSeshClient,
+	type NativeArtifactProjection,
+	type NativeManagedArtifactKey,
+} from "./managed-artifact-publisher.ts";
+export {
+	LIVE_INPUT_IMAGE_READER_CAPABILITY,
+	startLiveInputImageReader,
+	startLiveSessionInputImageReader,
+	type CurrentBranchInputImageCapableHost,
+	type LiveInputImageReader,
+	type NativeAssociatedInputImageProjection,
+	type NativeCurrentBranchInputImage,
+	type StartLiveInputImageReaderOptions,
+	type StartLiveSessionInputImageReaderOptions,
+} from "./input-image-reader.ts";
+export { inputImageSocketPath, legacySocketPath, liveSocketPath, pickSocketsDir } from "./socket-paths.ts";
+
 /**
  * RPC Socket Extension for Pi
  *
@@ -37,41 +109,24 @@
  */
 import * as net from "node:net";
 import * as fs from "node:fs";
-import * as path from "node:path";
+import { legacySocketPath, pickSocketsDir } from "./socket-paths.ts";
+import {
+	detectLiveImageAdmissionCapability,
+	startLiveSessionTransport,
+	type LiveManagedArtifactOptions,
+	type LiveTransportHost,
+	type LiveInputImageReaderOptions,
+	type LiveTransportServer,
+} from "./live-transport.ts";
 import { execFileSync } from "node:child_process";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { Commands } from "./commands.ts";
-
-/**
- * Pick a sockets-dir whose Unix-domain socket paths will fit inside
- * sun_path. macOS caps that struct at 104 bytes (Linux at 108); a Pi
- * session ID is a 36-char UUID, plus "/" + ".sock" = 42 chars, so we
- * leave ~50 bytes of headroom. The default macOS $TMPDIR is
- * /var/folders/<u>/<n>/T/ (≈47 chars) which alone would make the full
- * socket path overflow. Try $TMPDIR first (matches the original
- * intent and Termux/Linux behavior); fall back to /tmp, then /var/tmp.
- */
-function pickSocketsDir(): string {
-	const SUN_PATH_LIMIT = 104;
-	const RESERVED_FOR_SOCKETNAME = 50;
-	const seen = new Set<string>();
-	const candidates: string[] = [];
-	for (const c of [process.env.TMPDIR, "/tmp", "/var/tmp"]) {
-		if (!c) continue;
-		const trimmed = c.replace(/\/+$/, "");
-		if (seen.has(trimmed)) continue;
-		seen.add(trimmed);
-		candidates.push(trimmed);
-	}
-	for (const c of candidates) {
-		const dir = path.join(c, "pi-rpc-sockets");
-		if (dir.length + RESERVED_FOR_SOCKETNAME <= SUN_PATH_LIMIT) return dir;
-	}
-	// No candidate fits; return the first one anyway and let listen() error
-	// loudly rather than silently picking something surprising.
-	return path.join(candidates[0] ?? "/tmp", "pi-rpc-sockets");
-}
+import {
+	readLiveAttachmentEnvironment,
+	type LiveAttachmentConsumerOptions,
+	type PrepareRpcPromptFiles,
+} from "./attachment-transfer.ts";
 
 const SOCKETS_DIR = pickSocketsDir();
 
@@ -178,7 +233,104 @@ function getTmuxInfo(): Record<string, unknown> | null {
 	return info;
 }
 
+type InteractiveReadyContext = {
+	liveRpcSession: LiveTransportHost & {
+		copyArtifactBytes?: unknown;
+		getCurrentBranchInputImage?: unknown;
+		copyInputImageBytes?: unknown;
+	};
+};
+type InteractiveReadyRegistrar = {
+	registerInteractiveReady?: (
+		handler: (context: InteractiveReadyContext) => void | (() => void | Promise<void>) | Promise<void | (() => void | Promise<void>)>,
+	) => void;
+};
+
+async function resolveLiveTransferOptions(
+	liveRpcSession: InteractiveReadyContext["liveRpcSession"],
+	onError: (error: unknown) => void,
+): Promise<{
+	attachments?: LiveAttachmentConsumerOptions;
+	managedArtifacts?: LiveManagedArtifactOptions;
+	inputImageReader?: LiveInputImageReaderOptions;
+}> {
+	const environment = readLiveAttachmentEnvironment();
+	if (environment.status === "absent") return {};
+	if (environment.status === "invalid") {
+		onError(new Error(environment.message));
+		return {};
+	}
+	const shared = {
+		threadId: environment.threadId,
+		inboxPath: environment.inboxPath,
+		apiSocketPath: environment.apiSocketPath,
+	};
+	const managedArtifacts = typeof liveRpcSession.copyArtifactBytes === "function" ? shared : undefined;
+	const inputImageReader = typeof liveRpcSession.getCurrentBranchInputImage === "function"
+		&& typeof liveRpcSession.copyInputImageBytes === "function" ? shared : undefined;
+	const withoutAttachments = {
+		...(managedArtifacts ? { managedArtifacts } : {}),
+		...(inputImageReader ? { inputImageReader } : {}),
+	};
+	try {
+		const runtime = await import("@earendil-works/pi-coding-agent") as unknown as Record<string, unknown>;
+		if (typeof runtime.prepareRpcPromptFiles !== "function") {
+			onError(new Error("Running Pi does not expose public prepareRpcPromptFiles; attachment leases are disabled"));
+			return withoutAttachments;
+		}
+		// Both exports come from this one module instance. The capability is exact-validated
+		// here and compared with the same startup snapshot by startLiveTransport(...).
+		// Helper presence without the exact capability preserves text attachments only.
+		const importedImageAdmissionCapability = detectLiveImageAdmissionCapability(
+			runtime.LIVE_RPC_IMAGE_ADMISSION_CAPABILITY,
+		);
+		return {
+			attachments: {
+				...shared,
+				prepareRpcPromptFiles: runtime.prepareRpcPromptFiles as PrepareRpcPromptFiles,
+				...(importedImageAdmissionCapability ? { importedImageAdmissionCapability } : {}),
+			},
+			...withoutAttachments,
+		};
+	} catch {
+		onError(new Error("Running Pi attachment helper could not be loaded; attachment leases are disabled"));
+		return withoutAttachments;
+	}
+}
+
+/** Register live-v1 only when the running Pi exposes its public interactive-ready capability. */
+function registerLiveTransportIfSupported(pi: ExtensionAPI): void {
+	const registrar = pi as ExtensionAPI & InteractiveReadyRegistrar;
+	if (typeof registrar.registerInteractiveReady !== "function") return;
+
+	let activeServer: LiveTransportServer | undefined;
+	let starting = false;
+	registrar.registerInteractiveReady(async ({ liveRpcSession }) => {
+		if (starting || activeServer) {
+			throw new Error("live-v1 transport is already active for this extension instance");
+		}
+		starting = true;
+		const onError = (error: unknown) => console.error("Live RPC socket error:", error);
+		try {
+			const sessionId = liveRpcSession.snapshot().sessionId;
+			const transfer = await resolveLiveTransferOptions(liveRpcSession, onError);
+			const server = await startLiveSessionTransport(liveRpcSession, sessionId, { onError, ...transfer });
+			activeServer = server;
+			let cleaned = false;
+			return async () => {
+				if (cleaned) return;
+				cleaned = true;
+				if (activeServer === server) activeServer = undefined;
+				await server.close();
+			};
+		} finally {
+			starting = false;
+		}
+	});
+}
+
 export default function (pi: ExtensionAPI) {
+	registerLiveTransportIfSupported(pi);
 	let server: net.Server | null = null;
 	let socketPath: string | null = null;
 	const subscribers = new Set<net.Socket>();
@@ -303,7 +455,7 @@ export default function (pi: ExtensionAPI) {
 
 		fs.mkdirSync(SOCKETS_DIR, { recursive: true });
 
-		socketPath = path.join(SOCKETS_DIR, `${sessionId}.sock`);
+		socketPath = legacySocketPath(sessionId, SOCKETS_DIR);
 
 		try {
 			fs.unlinkSync(socketPath);

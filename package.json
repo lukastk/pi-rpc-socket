@@ -1,7 +1,7 @@
 {
   "name": "pi-rpc-socket",
   "version": "0.2.0",
-  "description": "Per-session RPC into a running Pi TUI: messages, explicit commands and correlated operation outcomes.",
+  "description": "Per-session Unix transports into a running Pi TUI: selective protocol 2 and bounded all-origin live-v1 access.",
   "main": "index.ts",
   "type": "module",
   "repository": {
