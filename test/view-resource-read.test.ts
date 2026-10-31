@@ -409,9 +409,18 @@ test("7: identity is never partial, and one view cannot borrow another's", async
 	// Every one was refused at the wire: the host was never asked.
 	assert.equal(host.dispatched.length, 0);
 
-	// maxBytes exactly at the ceiling is accepted (clamped DOWN only, never up).
+	// maxBytes exactly at the ceiling is accepted...
 	client.send(read({ maxBytes: 32 * 1024 }, "at-ceiling"));
 	accepted(await client.next());
+	// ...and one byte over is REFUSED, not clamped. Pinned because the first version
+	// of this wire's own documentation said "clamped down", which is a different
+	// consumer contract: a caller that asked for more would have been handed a smaller
+	// page it could not tell apart from a short final page.
+	client.send(read({ maxBytes: 32 * 1024 + 1 }, "over-ceiling"));
+	const over = await client.next();
+	assert.equal(over.ok, false);
+	assert.equal(over.error.code, "invalid_request");
+	assert.match(over.error.message, /maxBytes must be an integer from 1 to 32768/);
 });
 
 // 8 --------------------------------------------------------------------------

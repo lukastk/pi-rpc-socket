@@ -485,7 +485,12 @@ function validateInteractiveInput(command: WireRecord, invalid: InvalidWireReque
 	);
 }
 
-/** The page ceiling the read contract fixes. `maxBytes` is clamped DOWN, never up. */
+/**
+ * The page ceiling the read contract fixes. A `maxBytes` above it is REFUSED, not
+ * clamped: silently returning a smaller page than asked for is indistinguishable, to
+ * the caller, from a short final page, so it would turn a caller's mistake into a
+ * wrong pagination decision.
+ */
 const VIEW_RESOURCE_PAGE_MAX_BYTES = 32 * 1024;
 const VIEW_RESOURCE_NAMES: ReadonlySet<string> = new Set(["output", "input", "diagnostics"]);
 

@@ -323,8 +323,9 @@ Every member of `ref` is required: a read is never served on partial identity.
 `command.interactionId` must equal `ref.interactionId`, checked before any host call,
 so one view cannot borrow another's authority. `cursor` is bounded JSON (8 KiB, depth
 8, 5000 nodes, 64-character keys) with no prototype-pollution key, accessor, cycle,
-shared alias or non-finite number. `maxBytes` is clamped **down** to the 32 KiB page
-ceiling, never up.
+shared alias or non-finite number. A `maxBytes` above the 32 KiB page ceiling is
+**refused**, not clamped: handing back a smaller page than asked for is
+indistinguishable from a short final page, so the caller is told instead.
 
 The host's result is forwarded **verbatim** as one of exactly five statuses:
 
@@ -336,9 +337,14 @@ The host's result is forwarded **verbatim** as one of exactly five statuses:
 | `already_resolved` | the view is closed |
 | `invalid` | the read was refused, with the reason in `error` |
 
-The socket adds no sixth status and rewrites none of the five. A result that is not one
-of them fails closed to the requester as `internal_error` rather than being forwarded
-as a partial page.
+The socket adds no sixth status and rewrites none of the five. A result whose envelope is not one of
+them fails closed to the requester as `internal_error`.
+
+The check is on the **envelope**: which of the five statuses it is, and that the
+fields that status carries are present and well-typed. It deliberately does **not**
+validate the interior of `page` — the host owns that contract and reports its own
+`page_invalid` / `page_too_large` diagnostics, and a socket-side copy of its page
+schema would be one more record to drift.
 
 #### `invalid` conflates retryable and terminal — read `error` to tell them apart
 

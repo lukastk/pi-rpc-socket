@@ -383,7 +383,9 @@ const INTERACTIVE_INPUT_CAPABILITY_FIELDS = [
  *
  * The 32 KiB page ceiling is deliberately NOT part of this record: the host does not
  * advertise it, so the socket must not invent a field claiming it does. The ceiling
- * lives in the wire validator, which clamps `maxBytes` down to it.
+ * lives in the wire validator, which REFUSES a `maxBytes` above it rather than
+ * silently clamping — a caller that asked for more should be told so, not handed a
+ * smaller page it did not ask for and cannot distinguish from a short last page.
  */
 export interface LiveViewResourceCapability {
 	readonly protocol: "pi.view-resources";
