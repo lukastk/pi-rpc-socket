@@ -319,6 +319,14 @@ reply and rejects a duplicate that is still in flight. Two viewers may read diff
 cursors concurrently, on the same or different connections, without interfering, and
 the same `id` on two connections is not a collision.
 
+`resource` is the **opaque name the declaring extension chose**, not a value from a
+fixed set — 1–64 characters matching `/^[a-z0-9][a-z0-9_-]*$/`, which is the host's own
+rule for a resource identity. `output` above is only an example. The host resolves the
+name by lookup, so an unknown-but-well-formed name comes back as `invalid` with
+`The view does not provide that resource.` rather than being refused at the wire: only
+the view knows what it declares. Note the pattern differs from `viewId`, which allows
+`/` and forbids `_`.
+
 Every member of `ref` is required: a read is never served on partial identity.
 `command.interactionId` must equal `ref.interactionId`, checked before any host call,
 so one view cannot borrow another's authority. `cursor` is bounded JSON (8 KiB, depth
