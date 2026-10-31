@@ -293,7 +293,8 @@ This byte reader only serves already-associated native input references. It is o
 
 ### Native view-resource reads
 
-A runtime that advertises the exact `pi.view-resources` capability adds one query
+A runtime that advertises the exact `pi.view-resources` capability — `protocol`,
+`version`, `read`, `staleness` and `retention`, every value literal — adds one query
 command, `view_resource_read`: one bounded page of one extension view's resource.
 Without that capability the command is simply absent from `queryCommandTypes` and is
 refused as a disallowed query type.

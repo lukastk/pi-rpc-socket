@@ -25,12 +25,19 @@ import extensionFactory from "../index.ts";
  * must survive the hop untouched.
  */
 
+/**
+ * Copied field for field from the host's own LIVE_RPC_VIEW_RESOURCE_CAPABILITY
+ * (`packages/coding-agent/src/modes/rpc/live-rpc-session.ts`). An exact-keys check
+ * against a fixture that does not match the real producer passes every test while the
+ * command never enters the allowlist in production, so this constant is only
+ * meaningful if it is the host's record and not the test's idea of it.
+ */
 const CAPABILITY = {
 	protocol: "pi.view-resources",
 	version: 1,
 	read: "view-resource-read-v1",
 	staleness: "binding-stale-v1",
-	page: "bounded-32k-v1",
+	retention: "requester-only",
 } as const;
 
 const REF = {
@@ -196,6 +203,15 @@ async function subscribed(client: Client, id: string): Promise<any> {
 
 // 1 --------------------------------------------------------------------------
 test("1: the capability is mirrored exactly, or not at all", async () => {
+	// The key set is pinned, not just the behaviour. An exact-keys detector whose
+	// expected fields drift from the producer's returns undefined forever and the
+	// command never enters the allowlist -- while every other test here still passes,
+	// because they all inject this same fixture. So assert the shape itself.
+	assert.deepEqual(
+		Object.keys(CAPABILITY).sort(),
+		["protocol", "read", "retention", "staleness", "version"],
+	);
+	assert.equal(CAPABILITY.retention, "requester-only");
 	assert.deepEqual(detectLiveViewResourceCapability({ ...CAPABILITY }), { ...CAPABILITY });
 	assert.equal(Object.isFrozen(detectLiveViewResourceCapability({ ...CAPABILITY })), true);
 	// A record the socket must NOT accept: extra key, missing key, wrong literal,
@@ -203,7 +219,8 @@ test("1: the capability is mirrored exactly, or not at all", async () => {
 	for (const bad of [
 		{ ...CAPABILITY, extra: 1 },
 		{ protocol: "pi.view-resources", version: 1, read: "view-resource-read-v1", staleness: "binding-stale-v1" },
-		{ ...CAPABILITY, page: "bounded-64k-v1" },
+		{ ...CAPABILITY, retention: "published" },
+		{ ...CAPABILITY, page: "bounded-32k-v1" },  // the field the socket must NOT expect
 		{ ...CAPABILITY, version: 2 },
 		{ ...CAPABILITY, protocol: "pi.view-resource" },
 		{ ...CAPABILITY, read: "view-resource-read-v2" },

@@ -360,7 +360,7 @@ const VIEW_RESOURCE_CAPABILITY_FIELDS = [
 	"version",
 	"read",
 	"staleness",
-	"page",
+	"retention",
 ] as const;
 
 const INTERACTIVE_INPUT_CAPABILITY_FIELDS = [
@@ -375,16 +375,22 @@ const INTERACTIVE_INPUT_CAPABILITY_FIELDS = [
 /**
  * What a runtime must advertise before `view_resource_read` is served.
  *
- * `read` names the read contract, `staleness` the binding-staleness rule and `page`
- * the page bound the host enforces. All three are literal: a runtime that paginates
- * to a different ceiling is a different contract, not a configurable one.
+ * Mirrored field for field from the host's own `LIVE_RPC_VIEW_RESOURCE_CAPABILITY`:
+ * `read` names the read operation, `staleness` the binding-staleness rule, and
+ * `retention` the fact that a page goes to the requesting caller only and is never
+ * published, replayed, cached or recorded as a command result. All are literal — a
+ * runtime with different semantics is a different contract, not a configurable one.
+ *
+ * The 32 KiB page ceiling is deliberately NOT part of this record: the host does not
+ * advertise it, so the socket must not invent a field claiming it does. The ceiling
+ * lives in the wire validator, which clamps `maxBytes` down to it.
  */
 export interface LiveViewResourceCapability {
 	readonly protocol: "pi.view-resources";
 	readonly version: 1;
 	readonly read: "view-resource-read-v1";
 	readonly staleness: "binding-stale-v1";
-	readonly page: "bounded-32k-v1";
+	readonly retention: "requester-only";
 }
 
 /**
@@ -398,13 +404,13 @@ export function detectLiveViewResourceCapability(value: unknown): LiveViewResour
 	if (!isRecord(value) || !hasExactKeys(value, VIEW_RESOURCE_CAPABILITY_FIELDS)) return undefined;
 	if (value.protocol !== "pi.view-resources" || value.version !== 1
 		|| value.read !== "view-resource-read-v1" || value.staleness !== "binding-stale-v1"
-		|| value.page !== "bounded-32k-v1") return undefined;
+		|| value.retention !== "requester-only") return undefined;
 	return Object.freeze({
 		protocol: "pi.view-resources",
 		version: 1,
 		read: "view-resource-read-v1",
 		staleness: "binding-stale-v1",
-		page: "bounded-32k-v1",
+		retention: "requester-only",
 	});
 }
 
