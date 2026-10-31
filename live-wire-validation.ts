@@ -492,7 +492,39 @@ function validateInteractiveInput(command: WireRecord, invalid: InvalidWireReque
  * wrong pagination decision.
  */
 const VIEW_RESOURCE_PAGE_MAX_BYTES = 32 * 1024;
-const VIEW_RESOURCE_NAMES: ReadonlySet<string> = new Set(["output", "input", "diagnostics"]);
+
+/**
+ * A resource name is an OPAQUE identifier the declaring extension chooses, not a value
+ * from a fixed set. Mirrored from the host's own rule
+ * (`core/extensions/view-resources.ts`: `VIEW_RESOURCE_NAME_MAX_LENGTH = 64`,
+ * `VIEW_RESOURCE_NAME_PATTERN = /^[a-z0-9][a-z0-9_-]*$/`, under the comment *"Resource
+ * names are developer identities, like view ids"*). The host validates the name where
+ * it is declared and resolves a read with `this.resources.get(name)` — a map lookup,
+ * not a switch over known names.
+ *
+ * This field first closed the name to `output | input | diagnostics`, which made the
+ * only example view's `index` resource unreadable over the wire while its `output`
+ * resource happened to pass — the worse failure, because a consumer testing one
+ * resource would have concluded the wire was sound. That was the socket asserting a
+ * constraint its producer does not have, the same error as advertising a capability
+ * field the host never sends.
+ *
+ * NOTE the pattern is NOT the view-id pattern: a resource name allows `_` and forbids
+ * `/`; a view id allows `/` and forbids `_`. Reusing `extensionViewIdField` here would
+ * reintroduce an invented constraint in the opposite direction.
+ *
+ * An unknown-but-well-formed name is the HOST's call, answered `invalid` with
+ * `The view does not provide that resource.` — not the socket's to pre-empt.
+ */
+const VIEW_RESOURCE_NAME_MAX_LENGTH = 64;
+const VIEW_RESOURCE_NAME_PATTERN = /^[a-z0-9][a-z0-9_-]*$/;
+const viewResourceNameField: FieldValidator = (value, field, invalid) => {
+	if (typeof value !== "string" || value.length < 1
+		|| value.length > VIEW_RESOURCE_NAME_MAX_LENGTH
+		|| !VIEW_RESOURCE_NAME_PATTERN.test(value)) {
+		invalid(`${field} must be a bounded lower-case resource identity`);
+	}
+};
 
 /**
  * One read of one view's resource. A pure QUERY: it retains nothing, emits no event
@@ -539,7 +571,7 @@ function validateViewResourceRead(command: WireRecord, invalid: InvalidWireReque
 					false,
 				);
 			},
-			resource: enumField(VIEW_RESOURCE_NAMES),
+			resource: viewResourceNameField,
 			cursor: extensionViewActionField,
 		},
 		{ ...optionalId, maxBytes: integerField(1, VIEW_RESOURCE_PAGE_MAX_BYTES) },

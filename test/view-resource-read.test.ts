@@ -393,7 +393,11 @@ test("7: identity is never partial, and one view cannot borrow another's", async
 		["negative revision", { ref: { ...REF, expectedRevision: -1 } }],
 		["non-integer viewVersion", { ref: { ...REF, viewVersion: 1.5 } }],
 		["uppercase viewId", { ref: { ...REF, viewId: "Demo/Output" } }],
-		["unknown resource", { resource: "secrets" }],
+		["resource with an uppercase letter", { resource: "Output" }],
+		["resource with a slash", { resource: "tool/index" }],
+		["empty resource", { resource: "" }],
+		["resource starting with an underscore", { resource: "_index" }],
+		["resource over 64 chars", { resource: "x".repeat(65) }],
 		["unknown command field", { nope: 1 }],
 		["maxBytes above the ceiling", { maxBytes: 32 * 1024 + 1 }],
 		["maxBytes zero", { maxBytes: 0 }],
@@ -408,6 +412,16 @@ test("7: identity is never partial, and one view cannot borrow another's", async
 	}
 	// Every one was refused at the wire: the host was never asked.
 	assert.equal(host.dispatched.length, 0);
+
+	// The resource name is an OPAQUE identity the extension chose, so any well-formed
+	// name is accepted and an unknown one is the host's call. `index` is the name the
+	// only example view actually declares, and the first version of this wire refused
+	// it while accepting that view's other resource, `output` — so a consumer testing
+	// one resource would have concluded the wire was sound.
+	for (const resource of ["index", "output", "input", "diagnostics", "tool_pane_index", "a-b_c", "x".repeat(64)]) {
+		client.send(read({ resource }, "name-ok"));
+		accepted(await client.next());
+	}
 
 	// maxBytes exactly at the ceiling is accepted...
 	client.send(read({ maxBytes: 32 * 1024 }, "at-ceiling"));
