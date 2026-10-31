@@ -162,3 +162,94 @@ test("socket-owned protocols are not host records and have no producer to mirror
 	assert.equal(LIVE_INPUT_IMAGE_READER_CAPABILITY.protocol, "pi.input-image-read");
 	assert.equal(MANAGED_ARTIFACT_CAPABILITY.protocol, "sesh.pi-artifact-map");
 });
+
+/**
+ * A DIFFERENT hazard from the one above, and the one that reaches a user.
+ *
+ * The question the audit answered was "is this record's literal read from its
+ * producer". The question here is "would ADDING A FIELD to a record this socket emits
+ * break the client that is already installed" — and a record can be entirely
+ * socket-owned, with no producer to drift from, and still be a tripwire.
+ *
+ * It is one: the installed plugin validates certain records with its own
+ * `assertOnlyFields`, which **throws** on a key it does not expect. Of its 84 call
+ * sites, exactly two guard a record this socket constructs. Adding a field to either
+ * would not fail anything here and would not fail in Pi — it would throw inside
+ * Obsidian, on the user's machine, in a record nobody was watching.
+ *
+ * So pin the key sets. A field added to either of these fails HERE, where it is cheap,
+ * and the fix is then a deliberate choice: ship the client first, or do not add it.
+ *
+ * Same honesty as above: this does not read the client. It makes the socket's emitted
+ * shape explicit and names the consumer check it has to stay inside.
+ */
+const CLIENT_EXACT_KEY_CHECKED = {
+	/**
+	 * Client: `assertOnlyFields(record, [...13], "Live attachment capability")` in
+	 * `src/sesh/live-adapter.ts`. Verified identical as a set at the time of writing.
+	 */
+	"sesh.pi-transfer attachment capability": [
+		"commandTypes", "imageInput", "leaseId", "leaseLifetimeMs", "maxAttachments",
+		"maxDispatchBytes", "maxFileBytes", "maxTextBytesPerFile", "maxTextBytesTotal",
+		"mode", "protocol", "requestId", "version",
+	],
+	/**
+	 * Client: `assertOnlyFields(value, ["requestId","status","reason","finishedAt"],
+	 * "Uncertain live dispatch result")`. Note it guards the `uncertain` variant ONLY —
+	 * `running`, `completed`, `failed` and `unavailable` are parsed without an
+	 * exact-key check, so they are not tripwires today.
+	 */
+	"uncertain dispatch result": ["finishedAt", "reason", "requestId", "status"],
+} as const;
+
+test("the attachment capability keeps exactly the keys the installed client allows", async () => {
+	const { ATTACHMENT_CAPABILITY } = await import("../attachment-transfer.ts");
+	const expected = [...CLIENT_EXACT_KEY_CHECKED["sesh.pi-transfer attachment capability"]];
+	assert.deepEqual(Object.keys(ATTACHMENT_CAPABILITY).sort(), expected);
+
+	// `imageInput` is the one field that varies at runtime, and both variants must keep
+	// the same key set — an extra key on either would reach the client just as surely.
+	const { startLiveTransport } = await import("../live-transport.ts");
+	assert.equal(typeof startLiveTransport, "function"); // the module loads
+	for (const imageInput of [false, true]) {
+		const variant = Object.freeze({ ...ATTACHMENT_CAPABILITY, imageInput });
+		assert.deepEqual(Object.keys(variant).sort(), expected);
+	}
+});
+
+test("the uncertain dispatch result keeps exactly the keys the installed client allows", () => {
+	// Built by the socket as `{requestId, status:"uncertain", reason:"native_dispatch_rejected",
+	// finishedAt}`. Constructed here the same way rather than imported, because the
+	// builder is internal; the point is that this list and the client's agree.
+	const record = {
+		requestId: "11111111-2222-4333-8444-555555555555",
+		status: "uncertain" as const,
+		reason: "native_dispatch_rejected" as const,
+		finishedAt: 1_700_000_000_000,
+	};
+	assert.deepEqual(
+		Object.keys(record).sort(),
+		[...CLIENT_EXACT_KEY_CHECKED["uncertain dispatch result"]],
+	);
+	// The two literal values the client also checks, so a rename of either is caught
+	// here rather than as "Uncertain live dispatch result is invalid" in Obsidian.
+	assert.equal(record.status, "uncertain");
+	assert.equal(record.reason, "native_dispatch_rejected");
+});
+
+/**
+ * Records the client exact-key-checks that this socket does NOT construct — listed so
+ * nobody adds them here and then believes the socket is constrained by them. Each is
+ * produced by Pi or by Sesh and forwarded content-opaque, so a socket change cannot
+ * break them; the risk belongs to whoever emits them.
+ *
+ *   Pi built-in completed / cancelled / failed outcome  (operationId, status, …)
+ *   Pi interactive input result                         (disposition, reason)
+ *   Pi session presentation and its five nested records
+ *   Stored current-branch / output-artifact pages, sessions, responses and errors
+ *   Attachment, delete-attachment and prepare-attachments responses
+ *   Thread page response
+ */
+test("the socket emits exactly two of the records the client exact-key-checks", () => {
+	assert.equal(Object.keys(CLIENT_EXACT_KEY_CHECKED).length, 2);
+});
