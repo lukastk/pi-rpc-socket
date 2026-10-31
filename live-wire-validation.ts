@@ -485,6 +485,67 @@ function validateInteractiveInput(command: WireRecord, invalid: InvalidWireReque
 	);
 }
 
+/** The page ceiling the read contract fixes. `maxBytes` is clamped DOWN, never up. */
+const VIEW_RESOURCE_PAGE_MAX_BYTES = 32 * 1024;
+const VIEW_RESOURCE_NAMES: ReadonlySet<string> = new Set(["output", "input", "diagnostics"]);
+
+/**
+ * One read of one view's resource. A pure QUERY: it retains nothing, emits no event
+ * and cannot be replayed, so its `id` is correlation only.
+ *
+ * Every member of `ref` is required. A read is never served on partial identity:
+ * `viewId`/`viewVersion` say which view and which generation of it, `expectedRevision`
+ * and `datasetId` say which state the caller believes it is reading, and the host
+ * answers `stale` — carrying no rows — if either has moved. Accepting a read with any
+ * of them missing would mean serving rows against an identity nobody asserted.
+ *
+ * `command.interactionId` must equal `ref.interactionId`, checked here at the wire
+ * before any host call, so one view cannot borrow another's authority.
+ *
+ * `cursor` is bounded by the SAME walker and budget as an extension-view action
+ * (8 KiB, depth 8, 5000 nodes, 64-char keys): no prototype-pollution key, accessor,
+ * cycle, shared alias or non-finite number, and the bound is enforced while walking
+ * rather than by serializing first.
+ */
+function validateViewResourceRead(command: WireRecord, invalid: InvalidWireRequest): void {
+	exactFields(
+		command,
+		{
+			interactionId: stringField,
+			ref: (value, field) => {
+				if (!isRecord(value)) invalid(`${field} must be an object`);
+				exactFields(
+					value as WireRecord,
+					{
+						interactionId: stringField,
+						viewId: extensionViewIdField,
+						viewVersion: integerField(0, Number.MAX_SAFE_INTEGER),
+						expectedRevision: integerField(0, Number.MAX_SAFE_INTEGER),
+						// Opaque to the socket: bounded, non-empty, never parsed.
+						datasetId: (inner, innerField) => {
+							if (typeof inner !== "string" || inner.length < 1 || inner.length > 512
+								|| /[\u0000-\u001f\u007f]/.test(inner)) {
+								invalid(`${innerField} must be 1-512 text characters without controls`);
+							}
+						},
+					},
+					{},
+					invalid,
+					false,
+				);
+			},
+			resource: enumField(VIEW_RESOURCE_NAMES),
+			cursor: extensionViewActionField,
+		},
+		{ ...optionalId, maxBytes: integerField(1, VIEW_RESOURCE_PAGE_MAX_BYTES) },
+		invalid,
+	);
+	const ref = command.ref;
+	if (isRecord(ref) && ref.interactionId !== command.interactionId) {
+		invalid("command.interactionId must equal command.ref.interactionId");
+	}
+}
+
 function validateHistory(command: WireRecord, invalid: InvalidWireRequest): void {
 	exactFields(
 		command,
@@ -605,6 +666,10 @@ export function validateLiveWireCommand(command: WireRecord, invalid: InvalidWir
 	}
 	if (command.type === "interactive_input") {
 		validateInteractiveInput(command, invalid);
+		return;
+	}
+	if (command.type === "view_resource_read") {
+		validateViewResourceRead(command, invalid);
 		return;
 	}
 	if (command.type === "history") {

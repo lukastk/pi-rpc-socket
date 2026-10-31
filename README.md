@@ -291,6 +291,106 @@ The reader calls only `getCurrentBranchInputImage(target,id)` and hardened `copy
 
 This byte reader only serves already-associated native input references. It is one of the prerequisites for `attachments.imageInput`, but it never reads pending images and submission remains a separate concern.
 
+### Native view-resource reads
+
+A runtime that advertises the exact `pi.view-resources` capability adds one query
+command, `view_resource_read`: one bounded page of one extension view's resource.
+Without that capability the command is simply absent from `queryCommandTypes` and is
+refused as a disallowed query type.
+
+```jsonc
+{"protocol":"live-v1","id":"vr-1","op":"query",
+ "target":{"streamId":"…","sessionEpoch":0,"sessionId":"…"},
+ "command":{
+   "type":"view_resource_read",
+   "interactionId":"int-1",
+   "ref":{"interactionId":"int-1","viewId":"demo/output","viewVersion":1,
+          "expectedRevision":7,"datasetId":"leaf:abc"},
+   "resource":"output",
+   "cursor":{"entryId":"e1","line":7,"segment":3},
+   "maxBytes":32768
+ }}
+```
+
+It is a **query**, so it retains nothing: no result record, no `get_result`, no event,
+no replay entry and nothing in a snapshot. `id` is correlation only — it pairs the
+reply and rejects a duplicate that is still in flight. Two viewers may read different
+cursors concurrently, on the same or different connections, without interfering, and
+the same `id` on two connections is not a collision.
+
+Every member of `ref` is required: a read is never served on partial identity.
+`command.interactionId` must equal `ref.interactionId`, checked before any host call,
+so one view cannot borrow another's authority. `cursor` is bounded JSON (8 KiB, depth
+8, 5000 nodes, 64-character keys) with no prototype-pollution key, accessor, cycle,
+shared alias or non-finite number. `maxBytes` is clamped **down** to the 32 KiB page
+ceiling, never up.
+
+The host's result is forwarded **verbatim** as one of exactly five statuses:
+
+| `status` | meaning |
+|---|---|
+| `page` | one page, with its binding, items and coverage |
+| `stale` | the revision or data set moved; **carries no rows** |
+| `not_found` | no such resource on that view |
+| `already_resolved` | the view is closed |
+| `invalid` | the read was refused, with the reason in `error` |
+
+The socket adds no sixth status and rewrites none of the five. A result that is not one
+of them fails closed to the requester as `internal_error` rather than being forwarded
+as a partial page.
+
+#### `invalid` conflates retryable and terminal — read `error` to tell them apart
+
+There is **no** `read_timed_out` status. A read that outruns the host's deadline comes
+back as:
+
+```jsonc
+{"status":"invalid","error":"The view resource handler did not finish within the read deadline."}
+```
+
+That is one of twelve diagnostics delivered under the single `invalid` status, so
+`status` alone cannot tell you whether re-offering the read is worth anything. The
+`error` prose is the only discriminator, and the socket forwards it untouched for
+exactly that reason.
+
+**Worth offering again** — the condition is transient:
+
+* `The view resource handler did not finish within the read deadline.`
+* `Too many resource reads are already in flight for this view.`
+
+**Not worth offering again** — the same request gets the same answer until something
+about the request or the view changes:
+
+* `The view does not provide that resource.`
+* `The read did not match this view.`
+* `The read was built for a different version of this view.`
+* `The resource cursor is not bounded JSON.`
+* `The view resource returned a cursor that does not advance.`
+* `The view resource produced a page above the page limit.`
+* `The view resource produced a page that is not bounded JSON.`
+* `The view resource handler returned a malformed result.`
+* `The view cannot establish which data set its resources describe.`
+* `The view resource handler failed.`
+
+A client should match on the exact prose rather than inferring from `status`. Treating
+all of `invalid` as terminal silently abandons reads that would have succeeded;
+treating all of it as retryable spins on requests that never will.
+
+#### Bounds
+
+Per connection, `maxConcurrentQueries` (16) reads may be in flight, each bounded by the
+32 KiB page ceiling — so **512 KiB** is the worst case a single connection can have
+outstanding. The 17th concurrent read is refused with `capacity`, and a duplicate of an
+in-flight `id` with `duplicate_request`.
+
+> The page ceiling and `maxConcurrentQueries` bound the same quantity from two
+> directions. **Neither may be raised without re-checking them together**, because the
+> product is what a consumer's queue has to absorb.
+
+A refused read's error code is classified by the socket, but on the query path the
+message is the host's own, bounded to 512 characters. The socket-owned replacement text
+used for strict dispatch refusals does not apply to reads.
+
 ### Native output-artifact presentation
 
 When Pi's snapshot carries the exact `pi.output-artifact-presentation` version-1 capability, `live-v1` advertises the independently gated transport capability:

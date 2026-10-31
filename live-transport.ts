@@ -355,6 +355,14 @@ const IMAGE_ADMISSION_CAPABILITY_FIELDS = [
 	"binaryInLive",
 ] as const;
 
+const VIEW_RESOURCE_CAPABILITY_FIELDS = [
+	"protocol",
+	"version",
+	"read",
+	"staleness",
+	"page",
+] as const;
+
 const INTERACTIVE_INPUT_CAPABILITY_FIELDS = [
 	"protocol",
 	"version",
@@ -363,6 +371,75 @@ const INTERACTIVE_INPUT_CAPABILITY_FIELDS = [
 	"busy",
 	"bash",
 ] as const;
+
+/**
+ * What a runtime must advertise before `view_resource_read` is served.
+ *
+ * `read` names the read contract, `staleness` the binding-staleness rule and `page`
+ * the page bound the host enforces. All three are literal: a runtime that paginates
+ * to a different ceiling is a different contract, not a configurable one.
+ */
+export interface LiveViewResourceCapability {
+	readonly protocol: "pi.view-resources";
+	readonly version: 1;
+	readonly read: "view-resource-read-v1";
+	readonly staleness: "binding-stale-v1";
+	readonly page: "bounded-32k-v1";
+}
+
+/**
+ * Exact-validate one `pi.view-resources` capability record and return a detached
+ * frozen copy. Nothing else implies support: not the presence of a view controller,
+ * not a declared resource, not an observed view event, not a Pi version. A runtime
+ * without this record simply does not get `view_resource_read` in its allowlist, and
+ * every other live-v1 surface is unaffected.
+ */
+export function detectLiveViewResourceCapability(value: unknown): LiveViewResourceCapability | undefined {
+	if (!isRecord(value) || !hasExactKeys(value, VIEW_RESOURCE_CAPABILITY_FIELDS)) return undefined;
+	if (value.protocol !== "pi.view-resources" || value.version !== 1
+		|| value.read !== "view-resource-read-v1" || value.staleness !== "binding-stale-v1"
+		|| value.page !== "bounded-32k-v1") return undefined;
+	return Object.freeze({
+		protocol: "pi.view-resources",
+		version: 1,
+		read: "view-resource-read-v1",
+		staleness: "binding-stale-v1",
+		page: "bounded-32k-v1",
+	});
+}
+
+/**
+ * The five-member result union a view-resource read may settle as, checked before the
+ * socket forwards it.
+ *
+ * This is a FORWARDING guard, not a re-classification: a recognised result is passed
+ * through byte for byte, including the `error` prose on `invalid`. The socket adds no
+ * sixth status and rewrites none of the five.
+ *
+ * `read_timed_out` is NOT a status. The host returns
+ * `{status:"invalid", error:"The view resource handler did not finish within the read
+ * deadline."}` — one of twelve diagnostics delivered under the single `invalid`
+ * status. Which is exactly why `error` must survive the hop: `invalid` alone cannot
+ * tell a consumer whether re-offering the read is worth anything.
+ */
+function isViewResourceResult(value: unknown): boolean {
+	if (!isRecord(value)) return false;
+	switch (value.status) {
+		case "page":
+			return hasExactKeys(value, ["status", "page"]) && isRecord(value.page);
+		case "stale":
+			return hasExactKeys(value, ["status", "revision", "datasetId"])
+				&& Number.isSafeInteger(value.revision) && (value.revision as number) >= 0
+				&& typeof value.datasetId === "string" && value.datasetId.length > 0;
+		case "not_found":
+		case "already_resolved":
+			return hasExactKeys(value, ["status"]);
+		case "invalid":
+			return hasExactKeys(value, ["status", "error"]) && typeof value.error === "string";
+		default:
+			return false;
+	}
+}
 
 /**
  * Exact-validate one `pi.interactive-input` capability record and return a detached
@@ -839,6 +916,7 @@ export async function startLiveTransport(
 	let queryCommandTypes = new Set(BASE_QUERY_COMMAND_TYPES);
 	let inputImageCapability: LiveInputImageCapability | undefined;
 	let interactiveInputCapability: LiveInteractiveInputCapability | undefined;
+	let viewResourceCapability: LiveViewResourceCapability | undefined;
 	let outputArtifactPresentationCapability: LiveOutputArtifactPresentationCapability | undefined;
 	let attachmentConsumer: LiveAttachmentConsumer | undefined;
 	let managedArtifactPublisher: ManagedArtifactPublisher | undefined;
@@ -1347,6 +1425,13 @@ export async function startLiveTransport(
 
 	const handleQuery = (client: Client, request: Record<string, unknown>) => {
 		const requestId = request.id as string;
+		// A view-resource read is the one query whose RESULT shape the socket checks.
+		// Every other query returns whatever its host command returns; this one has a
+		// fixed five-member union, and a page is bytes a viewer will render, so an
+		// unrecognised shape fails closed to the requester instead of being forwarded
+		// as a partial page. Recognised results pass through untouched.
+		const isViewResourceRead =
+			(request.command as Record<string, unknown> | undefined)?.type === "view_resource_read";
 		if (activeQueries.has(requestId) || results.has(requestId)) {
 			throw new WireError("duplicate_request", "request id is already active or retained");
 		}
@@ -1362,6 +1447,13 @@ export async function startLiveTransport(
 			}
 			settled = true;
 			activeQueries.delete(requestId);
+			if (isViewResourceRead && !isViewResourceResult(value)) {
+				reportError(new Error(`Live host returned a malformed view-resource result for ${requestId}`));
+				if (!client.closed) {
+					responseError(client, requestId, new WireError("internal_error", "view resource result is not one of the five contract statuses"));
+				}
+				return;
+			}
 			try {
 				if (!client.closed) response(client, requestId, value);
 			} catch (error) {
@@ -1418,6 +1510,7 @@ export async function startLiveTransport(
 						remoteAuth: "external",
 						transcript: TRANSCRIPT_CAPABILITIES,
 						...(interactiveInputCapability ? { interactiveInput: interactiveInputCapability } : {}),
+						...(viewResourceCapability ? { viewResources: viewResourceCapability } : {}),
 						...(inputImageCapability ? { inputImages: inputImageCapability } : {}),
 						...(outputArtifactPresentationCapability ? { outputArtifactPresentation: outputArtifactPresentationCapability } : {}),
 						...(inputImageReader ? { inputImageBytes: inputImageReader.capability } : {}),
@@ -1468,8 +1561,16 @@ export async function startLiveTransport(
 		(transferTarget as LiveSnapshot & Record<string, unknown>).interactiveInputCapability,
 	);
 	outputArtifactPresentationCapability = detectOutputArtifactPresentationCapability(transferTarget);
+	// Same startup snapshot as every other capability. A runtime without the exact
+	// record does not get `view_resource_read` in its allowlist at all, so an
+	// unsupported host refuses the command at `validateRequest` with
+	// `unknown_command` rather than dispatching a read it cannot serve.
+	viewResourceCapability = detectLiveViewResourceCapability(
+		(transferTarget as LiveSnapshot & Record<string, unknown>).viewResourceCapability,
+	);
 	if (inputImageCapability) queryCommandTypes.add("input_image_history");
 	if (outputArtifactPresentationCapability) queryCommandTypes.add("artifact_history");
+	if (viewResourceCapability) queryCommandTypes.add("view_resource_read");
 	// Strict native preparation support: the capability imported from the same module
 	// instance as `prepareRpcPromptFiles` must exist, the same startup snapshot must
 	// carry one, and the two detached records must be equal field for field. A missing,
