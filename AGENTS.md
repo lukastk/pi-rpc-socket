@@ -15,7 +15,7 @@ consumed rather than what it does:
 - **It is a mymain-only development checkout.** `~/mysetup/pi-rpc-socket` is
   deliberately absent from `MYSETUP_REPOS` in `myrig/scripts/installs/mysetup.sh`,
   so it is never cloned to the other machines. A cross-machine report calling it
-  "missing" on macstudio, macbook, ideapad, pocket4 or termux is expected, not a
+  "missing" on macstudio, macbook, ideapad, pocket4 or pixel9 is expected, not a
   fault to fix.
 - **mypi carries its own frozen copy, from the `live-v1` branch.** mypi's bundle embeds
   a snapshot pinned by `mypi/packaging/pins/socket-tree.json`. It comes from `live-v1`,
